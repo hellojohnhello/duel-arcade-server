@@ -1,7 +1,7 @@
 {
   "name": "duel-arcade-relay",
-  "version": "1.0.0",
-  "description": "WebSocket relay server for the Duel Arcade two-player mini-games.",
+  "version": "2.0.0",
+  "description": "WebSocket relay server for Duel Arcade (multiplayer, up to 6 players per room).",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
