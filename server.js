@@ -1,24 +1,26 @@
 /* ============================================================
-   Duel Arcade — relay server
-   Matchmaking by 4-letter room code + message relay between
-   exactly two players. Works on any network (no peer-to-peer).
+   Duel Arcade — relay server (v2, multiplayer up to 6)
+   - Matchmaking by 4-letter room code.
+   - Host is the authority; relays state to all guests.
+   - Guests send inputs to the host.
+   - Backward compatible with the original 2-player games.
    ============================================================ */
 
 const http = require('http');
 const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 3000;
-const ROOM_TTL_MS = 1000 * 60 * 30;        // forget empty rooms after 30 min
-const SELF_PING_MS = 1000 * 60 * 13;       // self-ping under the 15-min idle limit
+const MAX_PLAYERS = 6;
+const ROOM_TTL_MS = 1000 * 60 * 30;
+const SELF_PING_MS = 1000 * 60 * 13;
 
-// rooms: code -> { host: ws|null, guest: ws|null, createdAt }
+// code -> { members:[{ws,pid,name,role}], createdAt }
 const rooms = new Map();
 
 function log(...a){ console.log(new Date().toISOString(), ...a); }
 
-// ---- HTTP server (also serves healthcheck for keep-alive pings) ----
 const server = http.createServer((req, res) => {
-  if (req.url === '/healthcheck' || req.url === '/' ) {
+  if (req.url === '/healthcheck' || req.url === '/') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end('ok ' + rooms.size + ' rooms');
     return;
@@ -28,120 +30,107 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocketServer({ server });
 
-function send(ws, obj){
-  if (ws && ws.readyState === ws.OPEN) {
-    try { ws.send(JSON.stringify(obj)); } catch (e) {}
-  }
+function send(ws, obj){ if (ws && ws.readyState === ws.OPEN){ try { ws.send(JSON.stringify(obj)); } catch (e) {} } }
+function roomOf(ws){ return rooms.get(ws.code); }
+function roster(room){ return room.members.map(m => ({ pid:m.pid, name:m.name, role:m.role })); }
+function broadcastRoster(room){
+  const list = roster(room);
+  const host = room.members.find(m => m.role === 'host');
+  const hostId = host ? host.pid : null;
+  for (const m of room.members) send(m.ws, { t:'roster', players:list, hostId });
 }
-function otherIn(room, ws){
-  if (!room) return null;
-  return room.host === ws ? room.guest : room.host;
+function cleanup(code){
+  const room = rooms.get(code); if (!room) return;
+  room.members = room.members.filter(m => m.ws.readyState === m.ws.OPEN);
+  if (room.members.length === 0){ rooms.delete(code); log('room closed', code); }
 }
-function cleanupRoom(code){
-  const room = rooms.get(code);
-  if (!room) return;
-  const empty = (!room.host || room.host.readyState !== room.host.OPEN) &&
-                (!room.guest || room.guest.readyState !== room.guest.OPEN);
-  if (empty) { rooms.delete(code); log('room closed', code); }
-}
+function genCode(){ const AB='ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+  let c; do { c = Array.from({length:4}, () => AB[Math.floor(Math.random()*AB.length)]).join(''); } while (rooms.has(c)); return c; }
 
 wss.on('connection', (ws) => {
-  ws.isAlive = true;
-  ws.on('pong', () => { ws.isAlive = true; });
-
-  ws.role = null;   // 'host' | 'guest'
-  ws.code = null;
+  ws.isAlive = true; ws.on('pong', () => { ws.isAlive = true; });
+  ws.role = null; ws.code = null; ws.pid = null;
 
   ws.on('message', (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw.toString()); } catch (e) { return; }
+    let msg; try { msg = JSON.parse(raw.toString()); } catch (e) { return; }
 
-    // ---- create a room (host) ----
     if (msg.t === 'host') {
-      // generate a unique code
       let code = (msg.code || '').toUpperCase();
-      if (!code || rooms.has(code)) {
-        const AB = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
-        do { code = Array.from({length:4}, () => AB[Math.floor(Math.random()*AB.length)]).join(''); }
-        while (rooms.has(code));
-      }
-      rooms.set(code, { host: ws, guest: null, createdAt: Date.now() });
-      ws.role = 'host'; ws.code = code;
-      send(ws, { t: 'hosted', code });
+      if (!code || rooms.has(code)) code = genCode();
+      ws.role = 'host'; ws.code = code; ws.pid = msg.pid || ('h' + Date.now());
+      rooms.set(code, { members: [{ ws, pid: ws.pid, name: msg.name || 'Host', role: 'host' }], createdAt: Date.now() });
+      send(ws, { t:'hosted', code, you: ws.pid });
+      broadcastRoster(rooms.get(code));
       log('room created', code);
       return;
     }
 
-    // ---- join a room (guest) ----
     if (msg.t === 'join') {
       const code = (msg.code || '').toUpperCase();
       const room = rooms.get(code);
-      if (!room) { send(ws, { t: 'join_error', reason: 'no_room', code }); return; }
-      if (room.guest && room.guest.readyState === room.guest.OPEN) {
-        send(ws, { t: 'join_error', reason: 'full', code }); return;
-      }
-      room.guest = ws; ws.role = 'guest'; ws.code = code;
-      send(ws, { t: 'joined', code });
-      // tell both sides the peer is present
-      send(room.host, { t: 'peer_joined' });
-      send(ws, { t: 'peer_joined' });
-      log('room joined', code);
+      if (!room) { send(ws, { t:'join_error', reason:'no_room', code }); return; }
+      if (room.members.length >= MAX_PLAYERS) { send(ws, { t:'join_error', reason:'full', code }); return; }
+      ws.role = 'guest'; ws.code = code; ws.pid = msg.pid || ('g' + Date.now());
+      room.members.push({ ws, pid: ws.pid, name: msg.name || 'Player', role: 'guest' });
+      send(ws, { t:'joined', code, you: ws.pid });
+      broadcastRoster(room);
+      log('joined', code, '->', room.members.length, 'players');
       return;
     }
 
-    // ---- relay any game payload to the other player ----
     if (msg.t === 'relay') {
-      const room = rooms.get(ws.code);
-      const peer = otherIn(room, ws);
-      if (peer) send(peer, { t: 'relay', from: ws.role, payload: msg.payload });
+      const room = roomOf(ws); if (!room) return;
+      const me = room.members.find(m => m.ws === ws); if (!me) return;
+      if (me.role === 'host') {
+        for (const m of room.members) { if (m.ws !== ws) send(m.ws, { t:'relay', fromId: me.pid, payload: msg.payload }); }
+      } else {
+        const host = room.members.find(m => m.role === 'host');
+        if (host) send(host.ws, { t:'relay', fromId: me.pid, payload: msg.payload });
+      }
       return;
     }
   });
 
   ws.on('close', () => {
-    const room = rooms.get(ws.code);
-    if (room) {
-      const peer = otherIn(room, ws);
-      if (peer) send(peer, { t: 'peer_left' });
-      if (room.host === ws) room.host = null;
-      if (room.guest === ws) room.guest = null;
-      cleanupRoom(ws.code);
+    const room = roomOf(ws); if (!room) return;
+    const me = room.members.find(m => m.ws === ws);
+    room.members = room.members.filter(m => m.ws !== ws);
+    if (me && me.role === 'host') {
+      for (const m of room.members) send(m.ws, { t:'host_left' });
+      rooms.delete(ws.code);
+      log('host left, room closed', ws.code);
+    } else {
+      if (room.members.length > 0) broadcastRoster(room);
+      cleanup(ws.code);
     }
   });
 
   ws.on('error', () => {});
 });
 
-// ---- ping clients periodically; drop dead sockets ----
 const heartbeat = setInterval(() => {
   wss.clients.forEach((ws) => {
     if (ws.isAlive === false) { try { ws.terminate(); } catch(e){} return; }
-    ws.isAlive = false;
-    try { ws.ping(); } catch(e){}
+    ws.isAlive = false; try { ws.ping(); } catch(e){}
   });
 }, 30000);
 
-// ---- forget stale empty rooms ----
 const sweeper = setInterval(() => {
   const cutoff = Date.now() - ROOM_TTL_MS;
   for (const [code, room] of rooms) {
-    const empty = (!room.host || room.host.readyState !== 1) &&
-                  (!room.guest || room.guest.readyState !== 1);
-    if (empty && room.createdAt < cutoff) { rooms.delete(code); log('room expired', code); }
+    const anyOpen = room.members.some(m => m.ws.readyState === 1);
+    if (!anyOpen && room.createdAt < cutoff) { rooms.delete(code); log('room expired', code); }
   }
 }, 1000 * 60 * 5);
 
-// ---- backup self-ping to reduce idle spin-down (best-effort) ----
 let selfPingTimer = null;
 function startSelfPing(){
-  const url = process.env.SELF_URL; // set this in Render to your service URL for backup keep-alive
-  if (!url) return;
+  const url = process.env.SELF_URL; if (!url) return;
   selfPingTimer = setInterval(() => {
     const mod = url.startsWith('https') ? require('https') : require('http');
     try { mod.get(url + '/healthcheck', (r) => { r.resume(); }).on('error', () => {}); } catch(e){}
   }, SELF_PING_MS);
 }
 
-server.listen(PORT, () => { log('Duel Arcade relay listening on', PORT); startSelfPing(); });
-
+server.listen(PORT, () => { log('Duel Arcade relay (v2, up to ' + MAX_PLAYERS + ') listening on', PORT); startSelfPing(); });
 wss.on('close', () => { clearInterval(heartbeat); clearInterval(sweeper); if (selfPingTimer) clearInterval(selfPingTimer); });
